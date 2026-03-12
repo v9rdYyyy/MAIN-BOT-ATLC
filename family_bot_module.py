@@ -44,10 +44,6 @@ APPLICATION_COOLDOWN_DAYS = 7
 # БАЗОВАЯ ЛОГИКА
 # ============================================================
 TOKEN = (os.getenv("TOKEN") or os.getenv("DISCORD_TOKEN") or FALLBACK_TOKEN or "").replace("Bot ", "").strip()
-if not TOKEN:
-    raise RuntimeError(
-        "Токен не найден. Вставь токен в FALLBACK_TOKEN внутри bot.py или задай TOKEN / DISCORD_TOKEN на хостинге."
-    )
 
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -1853,6 +1849,10 @@ async def on_guild_join(guild: discord.Guild) -> None:
 
 
 if __name__ == "__main__":
+    if not TOKEN:
+        raise RuntimeError(
+            "Не найден токен. Хостинг должен передать TOKEN / DISCORD_TOKEN, или укажи FALLBACK_TOKEN вручную."
+        )
     try:
         bot.run(TOKEN, log_handler=None)
     except discord.errors.LoginFailure:
