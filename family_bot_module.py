@@ -87,6 +87,7 @@ COLOR_DANGER = discord.Color.red()
 class GuildConfig:
     guild_id: int
     result_channel_id: int = 0
+    archive_log_channel_id: int = 0
     voice_channel_id: int = 0
     review_role_id: int = 0
     recruiter_ping_user_id: int = 0
@@ -128,6 +129,7 @@ class Database:
                 CREATE TABLE IF NOT EXISTS guild_settings (
                     guild_id INTEGER PRIMARY KEY,
                     result_channel_id INTEGER DEFAULT 0,
+                    archive_log_channel_id INTEGER DEFAULT 0,
                     voice_channel_id INTEGER DEFAULT 0,
                     review_role_id INTEGER DEFAULT 0,
                     recruiter_ping_user_id INTEGER DEFAULT 0,
@@ -168,6 +170,7 @@ class Database:
                 )
                 """
             )
+            self._ensure_column(conn, "guild_settings", "archive_log_channel_id", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "guild_settings", "cooldown_enabled", "INTEGER DEFAULT 1")
             self._ensure_column(conn, "guild_settings", "recruiter_ping_user_id", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "guild_settings", "panel_image_url", "TEXT DEFAULT ''")
@@ -220,6 +223,7 @@ class Database:
         default = GuildConfig(
             guild_id=guild_id,
             result_channel_id=DEFAULT_RESULTS_CHANNEL_ID,
+            archive_log_channel_id=0,
             voice_channel_id=DEFAULT_INTERVIEW_VOICE_CHANNEL_ID,
             review_role_id=DEFAULT_REVIEW_ROLE_ID,
             recruiter_ping_user_id=0,
@@ -244,6 +248,7 @@ class Database:
         return GuildConfig(
             guild_id=row["guild_id"],
             result_channel_id=row["result_channel_id"] or default.result_channel_id,
+            archive_log_channel_id=(row["archive_log_channel_id"] if "archive_log_channel_id" in row.keys() and row["archive_log_channel_id"] is not None else 0),
             voice_channel_id=row["voice_channel_id"] or default.voice_channel_id,
             review_role_id=row["review_role_id"] or default.review_role_id,
             recruiter_ping_user_id=row["recruiter_ping_user_id"] if "recruiter_ping_user_id" in row.keys() and row["recruiter_ping_user_id"] is not None else 0,
@@ -264,6 +269,7 @@ class Database:
         current = self.get_config(guild_id)
         payload = {
             "result_channel_id": current.result_channel_id,
+            "archive_log_channel_id": current.archive_log_channel_id,
             "voice_channel_id": current.voice_channel_id,
             "review_role_id": current.review_role_id,
             "recruiter_ping_user_id": current.recruiter_ping_user_id,
@@ -299,6 +305,7 @@ class Database:
                 INSERT INTO guild_settings (
                     guild_id,
                     result_channel_id,
+                    archive_log_channel_id,
                     voice_channel_id,
                     review_role_id,
                     recruiter_ping_user_id,
@@ -314,9 +321,10 @@ class Database:
                     panel_media_kind,
                     panel_media_filename,
                     updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(guild_id) DO UPDATE SET
                     result_channel_id = excluded.result_channel_id,
+                    archive_log_channel_id = excluded.archive_log_channel_id,
                     voice_channel_id = excluded.voice_channel_id,
                     review_role_id = excluded.review_role_id,
                     recruiter_ping_user_id = excluded.recruiter_ping_user_id,
@@ -336,6 +344,7 @@ class Database:
                 (
                     guild_id,
                     payload["result_channel_id"],
+                    payload["archive_log_channel_id"],
                     payload["voice_channel_id"],
                     payload["review_role_id"],
                     payload["recruiter_ping_user_id"],
@@ -1072,9 +1081,10 @@ def should_delete_source_application_channel(
 
 
 async def get_archive_log_channel(guild: discord.Guild, config: GuildConfig) -> discord.TextChannel:
-    channel = guild.get_channel(config.result_channel_id)
+    channel_id = int(config.archive_log_channel_id or config.result_channel_id or 0)
+    channel = guild.get_channel(channel_id) if channel_id else None
     if not isinstance(channel, discord.TextChannel):
-        raise RuntimeError("Канал итогов/архива не найден. Проверь настройку /family_setup.")
+        raise RuntimeError("Канал архива не найден. Проверь настройку /family_setup.")
     return channel
 
 
@@ -1418,7 +1428,7 @@ class RejectReasonModal(discord.ui.Modal):
         success, archive_seq, error_text = await run_application_recovery_job(interaction.guild, application["id"])
         if success:
             await interaction.followup.send(
-                f"Причина сохранена. Архивная запись `#{archive_seq:03d}` создана в канале итогов.",
+                f"Причина сохранена. Архивная запись `#{archive_seq:03d}` создана в канале архива.",
                 ephemeral=True,
             )
             return
@@ -1914,7 +1924,7 @@ class InterviewView(discord.ui.View):
         success, archive_seq, error_text = await run_application_recovery_job(interaction.guild, application["id"])
         if success:
             await interaction.followup.send(
-                f"Обзвон отмечен как успешный. Архивная запись `#{archive_seq:03d}` создана в канале итогов.",
+                f"Обзвон отмечен как успешный. Архивная запись `#{archive_seq:03d}` создана в канале архива.",
                 ephemeral=True,
             )
             return
@@ -2029,7 +2039,8 @@ async def process_review_decision(interaction: discord.Interaction, reserve: boo
 # ============================================================
 @app_commands.command(name="family_setup", description="Настроить каналы, роль рекрутов и внешний вид панели")
 @app_commands.describe(
-    result_channel="Канал итогов и архива заявок",
+    result_channel="Канал итогов заявок",
+    archive_log_channel="Канал, куда будут падать архивные сообщения",
     voice_channel="Голосовой канал для обзвона",
     review_role="Роль рекрутов",
     applications_category="Категория активных заявок",
@@ -2042,6 +2053,7 @@ async def family_setup(
     result_channel: discord.TextChannel,
     voice_channel: discord.VoiceChannel,
     review_role: discord.Role,
+    archive_log_channel: Optional[discord.TextChannel] = None,
     applications_category: Optional[discord.CategoryChannel] = None,
     archive_category: Optional[discord.CategoryChannel] = None,
     server_name: Optional[str] = None,
@@ -2055,9 +2067,11 @@ async def family_setup(
         return
 
     current_config = db.get_config(interaction.guild.id)
+    selected_archive_log_channel = archive_log_channel or (interaction.guild.get_channel(current_config.archive_log_channel_id) if current_config.archive_log_channel_id else None) or result_channel
     config = db.upsert_config(
         interaction.guild.id,
         result_channel_id=result_channel.id,
+        archive_log_channel_id=selected_archive_log_channel.id if isinstance(selected_archive_log_channel, discord.TextChannel) else result_channel.id,
         voice_channel_id=voice_channel.id,
         review_role_id=review_role.id,
         recruiter_ping_user_id=current_config.recruiter_ping_user_id,
@@ -2073,7 +2087,10 @@ async def family_setup(
     await refresh_panel_message(interaction.guild)
 
     embed = discord.Embed(title="Настройка сохранена", color=COLOR_SUCCESS)
-    embed.add_field(name="Канал итогов и архива", value=f"{result_channel.mention}\n`{config.result_channel_id}`", inline=False)
+    archive_log_channel_obj = interaction.guild.get_channel(config.archive_log_channel_id)
+    archive_log_text = archive_log_channel_obj.mention if isinstance(archive_log_channel_obj, discord.TextChannel) else result_channel.mention
+    embed.add_field(name="Канал итогов", value=f"{result_channel.mention}\n`{config.result_channel_id}`", inline=False)
+    embed.add_field(name="Канал архива", value=f"{archive_log_text}\n`{config.archive_log_channel_id or config.result_channel_id}`", inline=False)
     embed.add_field(name="Голосовой канал", value=f"{voice_channel.mention}\n`{config.voice_channel_id}`", inline=False)
     embed.add_field(name="Роль рекрутов", value=f"{review_role.mention}\n`{config.review_role_id}`", inline=False)
     embed.add_field(name="Пинг роли при новой заявке", value=recruiter_ping_summary(interaction.guild, config), inline=False)
@@ -2255,7 +2272,8 @@ async def family_config(interaction: discord.Interaction) -> None:
 
     config = db.get_config(interaction.guild.id)
     embed = discord.Embed(title="Текущая настройка", color=COLOR_INFO)
-    embed.add_field(name="Канал итогов и архива", value=f"`{config.result_channel_id or 0}`", inline=False)
+    embed.add_field(name="Канал итогов", value=f"`{config.result_channel_id or 0}`", inline=False)
+    embed.add_field(name="Канал архива", value=f"`{config.archive_log_channel_id or config.result_channel_id or 0}`", inline=False)
     embed.add_field(name="Голосовой канал проверки", value=f"`{config.voice_channel_id or 0}`", inline=False)
     embed.add_field(name="Роль рекрутов", value=f"`{config.review_role_id or 0}`", inline=False)
     embed.add_field(name="Пинг роли при новой заявке", value=recruiter_ping_summary(interaction.guild, config), inline=False)
@@ -2400,7 +2418,7 @@ async def family_archive_find(
 
     lines: list[str] = []
     for row in archived_rows[:20]:
-        archive_channel_id = int(row["archive_message_channel_id"] or config.result_channel_id or 0)
+        archive_channel_id = int(row["archive_message_channel_id"] or config.archive_log_channel_id or config.result_channel_id or 0)
         archive_message_id = int(row["archive_message_id"] or 0)
         archive_channel_obj = interaction.guild.get_channel(archive_channel_id)
         archive_channel_text = archive_channel_obj.mention if isinstance(archive_channel_obj, discord.TextChannel) else f"`{archive_channel_id or 0}`"
