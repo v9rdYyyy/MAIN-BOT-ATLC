@@ -69,6 +69,11 @@ FINAL_STATUSES = {
     STATUS_ACCEPTED,
 }
 
+RECOVERY_JOB_PENDING = "pending"
+RECOVERY_JOB_RUNNING = "running"
+RECOVERY_JOB_FAILED = "failed"
+RECOVERY_JOB_DONE = "done"
+
 _REASON_UNSET = object()
 
 COLOR_PANEL = discord.Color.from_rgb(155, 26, 39)
@@ -171,7 +176,28 @@ class Database:
             self._ensure_column(conn, "applications", "interview_message_id", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "applications", "archive_seq", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "applications", "archived_at", "TEXT")
+            self._ensure_column(conn, "applications", "chat_opened", "INTEGER DEFAULT 0")
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS recovery_jobs (
+                    application_id INTEGER PRIMARY KEY,
+                    guild_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    reviewer_id INTEGER DEFAULT 0,
+                    final_status TEXT NOT NULL,
+                    job_status TEXT NOT NULL,
+                    payload_json TEXT NOT NULL,
+                    progress_json TEXT NOT NULL,
+                    attempts INTEGER DEFAULT 0,
+                    last_error TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    FOREIGN KEY(application_id) REFERENCES applications(id) ON DELETE CASCADE
+                )
+                """
+            )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_channel ON applications(channel_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_recovery_jobs_guild_status ON recovery_jobs(guild_id, job_status, application_id DESC)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_applications_status ON applications(status)")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_applications_guild_user_status ON applications(guild_id, user_id, status, id DESC)"
@@ -354,6 +380,13 @@ class Database:
                 (channel_id,),
             ).fetchone()
 
+    def get_application_by_id(self, application_id: int) -> Optional[sqlite3.Row]:
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                "SELECT * FROM applications WHERE id = ?",
+                (application_id,),
+            ).fetchone()
+
     def get_open_application_by_user(self, guild_id: int, user_id: int) -> Optional[sqlite3.Row]:
         with closing(self._connect()) as conn:
             return conn.execute(
@@ -408,6 +441,145 @@ class Database:
                 """,
                 (guild_id, user_id, limit),
             ).fetchall()
+
+    def list_final_applications(self, guild_id: int, application_id: Optional[int] = None) -> list[sqlite3.Row]:
+        params: list[Any] = [guild_id, STATUS_REJECTED, STATUS_INTERVIEW_FAILED, STATUS_ACCEPTED]
+        sql = (
+            "SELECT * FROM applications "
+            "WHERE guild_id = ? AND status IN (?, ?, ?)"
+        )
+        if application_id is not None:
+            sql += " AND id = ?"
+            params.append(application_id)
+        sql += " ORDER BY id DESC"
+
+        with closing(self._connect()) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def get_recovery_job(self, application_id: int) -> Optional[sqlite3.Row]:
+        with closing(self._connect()) as conn:
+            return conn.execute(
+                "SELECT * FROM recovery_jobs WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+
+    def list_recovery_jobs(
+        self,
+        guild_id: int,
+        *,
+        states: Optional[Iterable[str]] = None,
+        application_id: Optional[int] = None,
+    ) -> list[sqlite3.Row]:
+        params: list[Any] = [guild_id]
+        sql = "SELECT * FROM recovery_jobs WHERE guild_id = ?"
+        if application_id is not None:
+            sql += " AND application_id = ?"
+            params.append(application_id)
+
+        state_values = tuple(states or ())
+        if state_values:
+            placeholders = ", ".join("?" for _ in state_values)
+            sql += f" AND job_status IN ({placeholders})"
+            params.extend(state_values)
+
+        sql += " ORDER BY application_id DESC"
+        with closing(self._connect()) as conn:
+            return conn.execute(sql, params).fetchall()
+
+    def upsert_recovery_job(
+        self,
+        application_id: int,
+        *,
+        guild_id: int,
+        channel_id: int,
+        reviewer_id: int,
+        final_status: str,
+        payload: dict[str, Any],
+        progress: Optional[dict[str, Any]] = None,
+        reset_status: bool = False,
+    ) -> sqlite3.Row:
+        now = utcnow()
+        payload_json = json.dumps(payload, ensure_ascii=False)
+        progress_json = json.dumps(progress or default_recovery_progress(), ensure_ascii=False)
+
+        with closing(self._connect()) as conn, conn:
+            existing = conn.execute(
+                "SELECT * FROM recovery_jobs WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+            if existing is None:
+                conn.execute(
+                    """
+                    INSERT INTO recovery_jobs (
+                        application_id, guild_id, channel_id, reviewer_id, final_status,
+                        job_status, payload_json, progress_json, attempts, last_error, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, NULL, ?, ?)
+                    """,
+                    (
+                        application_id,
+                        guild_id,
+                        channel_id,
+                        reviewer_id,
+                        final_status,
+                        RECOVERY_JOB_PENDING,
+                        payload_json,
+                        progress_json,
+                        now,
+                        now,
+                    ),
+                )
+            else:
+                update_parts = [
+                    "guild_id = ?",
+                    "channel_id = ?",
+                    "reviewer_id = ?",
+                    "final_status = ?",
+                    "payload_json = ?",
+                    "updated_at = ?",
+                ]
+                params: list[Any] = [
+                    guild_id,
+                    channel_id,
+                    reviewer_id,
+                    final_status,
+                    payload_json,
+                    now,
+                ]
+                if reset_status:
+                    update_parts.extend([
+                        "job_status = ?",
+                        "progress_json = ?",
+                        "last_error = NULL",
+                    ])
+                    params.extend([
+                        RECOVERY_JOB_PENDING,
+                        progress_json,
+                    ])
+                params.append(application_id)
+                conn.execute(
+                    f"UPDATE recovery_jobs SET {', '.join(update_parts)} WHERE application_id = ?",
+                    params,
+                )
+
+            return conn.execute(
+                "SELECT * FROM recovery_jobs WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+
+    def update_recovery_job(self, application_id: int, **kwargs) -> Optional[sqlite3.Row]:
+        if not kwargs:
+            return self.get_recovery_job(application_id)
+        kwargs["updated_at"] = utcnow()
+        columns = ", ".join(f"{key} = ?" for key in kwargs.keys())
+        values = list(kwargs.values())
+        values.append(application_id)
+
+        with closing(self._connect()) as conn, conn:
+            conn.execute(f"UPDATE recovery_jobs SET {columns} WHERE application_id = ?", values)
+            return conn.execute(
+                "SELECT * FROM recovery_jobs WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
 
     def claim_application(self, application_id: int, reviewer_id: int) -> bool:
         with closing(self._connect()) as conn, conn:
@@ -641,11 +813,17 @@ def build_panel_popup_embed(guild: discord.Guild, config: GuildConfig) -> discor
     return apply_common_embed_style(embed, guild, config)
 
 
+
+
+
+
 def build_application_embed(
     applicant: discord.User | discord.Member,
     answers: dict[str, str],
     application_id: int,
     reviewer_mention: str | None = None,
+    *,
+    chat_opened: bool = False,
 ) -> discord.Embed:
     embed = discord.Embed(
         title="🆕 Новая заявка в семью",
@@ -667,6 +845,8 @@ def build_application_embed(
         if reviewer_mention
         else "Ожидает, пока рекрут нажмёт «Взять на рассмотрение»."
     )
+    if chat_opened:
+        review_text += "\n🗨️ Чат с кандидатом открыт в этом канале."
     embed.add_field(name="Статус рассмотрения", value=review_text, inline=False)
     embed.set_thumbnail(url=applicant.display_avatar.url)
     embed.set_footer(text=f"Заявку подал: {applicant} • {applicant.id}")
@@ -675,6 +855,90 @@ def build_application_embed(
 
 def build_results_embed(title: str, description: str, color: discord.Color) -> discord.Embed:
     return discord.Embed(title=title, description=description, color=color, timestamp=datetime.now(timezone.utc))
+
+
+
+def application_chat_opened(application: sqlite3.Row | None) -> bool:
+    return bool(int(application["chat_opened"] or 0)) if application else False
+
+
+def default_recovery_progress() -> dict[str, bool]:
+    return {
+        "results_sent": False,
+        "dm_attempted": False,
+        "review_message_disabled": False,
+        "interview_message_disabled": False,
+        "archived": False,
+    }
+
+
+def safe_json_loads(raw: Any, default: Any) -> Any:
+    if not raw:
+        return default
+    try:
+        return json.loads(raw)
+    except Exception:
+        return default
+
+
+def embed_to_payload(embed: discord.Embed | None) -> Optional[dict[str, Any]]:
+    if embed is None:
+        return None
+    return {
+        "title": embed.title or "",
+        "description": embed.description or "",
+        "color": int(embed.color.value if embed.color else COLOR_INFO.value),
+    }
+
+
+def payload_to_embed(payload: Optional[dict[str, Any]]) -> Optional[discord.Embed]:
+    if not payload:
+        return None
+    return discord.Embed(
+        title=payload.get("title") or None,
+        description=payload.get("description") or None,
+        color=int(payload.get("color") or COLOR_INFO.value),
+        timestamp=datetime.now(timezone.utc),
+    )
+
+
+def build_recovery_payload(
+    *,
+    results_embed: discord.Embed | None,
+    dm_embed: discord.Embed | None,
+    disable_stage: str,
+    archive_final_text: str,
+) -> dict[str, Any]:
+    return {
+        "results_embed": embed_to_payload(results_embed),
+        "dm_embed": embed_to_payload(dm_embed),
+        "disable_stage": disable_stage,
+        "archive_final_text": archive_final_text,
+    }
+
+
+def build_legacy_archive_recovery_payload(application: sqlite3.Row) -> dict[str, Any]:
+    reason = application["reason"] or "Причина не указана."
+    if application["status"] == STATUS_ACCEPTED:
+        return build_recovery_payload(
+            results_embed=None,
+            dm_embed=None,
+            disable_stage="interview",
+            archive_final_text="Заявка была принята.",
+        )
+    if application["status"] == STATUS_INTERVIEW_FAILED:
+        return build_recovery_payload(
+            results_embed=None,
+            dm_embed=None,
+            disable_stage="interview",
+            archive_final_text=f'Заявка была отклонена по причине: "{reason}".',
+        )
+    return build_recovery_payload(
+        results_embed=None,
+        dm_embed=None,
+        disable_stage="review",
+        archive_final_text=f'Заявка была отклонена по причине: "{reason}".',
+    )
 
 
 def recruiter_ping_summary(guild: discord.Guild, config: GuildConfig) -> str:
@@ -763,29 +1027,53 @@ async def refresh_panel_message(guild: discord.Guild) -> None:
         logger.exception("Не удалось обновить панель набора в guild %s", guild.id)
 
 
+
 async def archive_application_channel(
     channel: discord.TextChannel,
     config: GuildConfig,
     application: sqlite3.Row,
-    reviewer: discord.Member,
+    reviewer: discord.abc.User | discord.Member | None,
     final_text: str,
 ) -> int:
-    archive_seq = db.next_archive_seq(application["guild_id"], application["user_id"])
+    archive_seq = int(application["archive_seq"] or 0) or db.next_archive_seq(application["guild_id"], application["user_id"])
     archive_category = await get_or_create_category(channel.guild, config.archive_category_id, ARCHIVE_CATEGORY_NAME)
     archive_name = build_archive_channel_name(application["user_id"], archive_seq)
 
+    reviewer_id = int(reviewer.id) if reviewer else int(application["reviewer_id"] or 0)
+    reviewer_text = reviewer.mention if reviewer else (f"<@{reviewer_id}>" if reviewer_id else "не указан")
+
     db.update_application(
         application["id"],
-        reviewer_id=reviewer.id,
+        reviewer_id=reviewer_id,
         archive_seq=archive_seq,
         archived_at=utcnow(),
+        chat_opened=0,
     )
+
+    try:
+        await channel.set_permissions(
+            discord.Object(id=int(application["user_id"])),
+            overwrite=None,
+            reason="Заявка завершена и отправлена в архив",
+        )
+    except Exception:
+        logger.exception("Не удалось очистить доступ кандидата к каналу %s", channel.id)
+
+    if reviewer_id:
+        try:
+            await channel.set_permissions(
+                discord.Object(id=reviewer_id),
+                overwrite=None,
+                reason="Заявка завершена и отправлена в архив",
+            )
+        except Exception:
+            logger.exception("Не удалось очистить персональный доступ рекрута к каналу %s", channel.id)
 
     await channel.edit(
         category=archive_category,
         name=archive_name,
         topic=(
-            f"Архив заявки пользователя {application['user_id']} | №{archive_seq:03d} | Рассматривал {reviewer.id}"
+            f"Архив заявки пользователя {application['user_id']} | №{archive_seq:03d} | Рассматривал {reviewer_id or 'не указан'}"
         )[:1024],
         reason="Заявка рассмотрена и отправлена в архив",
     )
@@ -793,10 +1081,203 @@ async def archive_application_channel(
     await clear_channel_history(channel)
     await channel.send(
         f"Канал архивирован.\n"
-        f"Заявка завершена. Рассматривал: {reviewer.mention}\n"
+        f"Заявка завершена. Рассматривал: {reviewer_text}\n"
         f"{final_text}"
     )
     return archive_seq
+
+
+
+async def run_application_recovery_job(guild: discord.Guild, application_id: int) -> tuple[bool, int, str]:
+    application = db.get_application_by_id(application_id)
+    if not application:
+        return False, 0, "Заявка не найдена в базе."
+
+    job = db.get_recovery_job(application_id)
+    if not job:
+        return False, 0, "Для заявки не найдена recovery-задача."
+
+    progress = default_recovery_progress()
+    progress.update(safe_json_loads(job["progress_json"], {}))
+    payload = safe_json_loads(job["payload_json"], {})
+    db.update_recovery_job(
+        application_id,
+        job_status=RECOVERY_JOB_RUNNING,
+        attempts=int(job["attempts"] or 0) + 1,
+        last_error=None,
+    )
+
+    config = db.get_config(guild.id)
+    archive_seq = int(application["archive_seq"] or 0)
+
+    try:
+        applicant = await fetch_application_user(guild, int(application["user_id"]))
+
+        results_embed = payload_to_embed(payload.get("results_embed"))
+        if results_embed is not None and not progress["results_sent"]:
+            await send_results_message(guild, config, results_embed)
+            progress["results_sent"] = True
+            db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
+
+        if "dm_embed" in payload and not progress["dm_attempted"]:
+            dm_embed = payload_to_embed(payload.get("dm_embed"))
+            if dm_embed is not None and applicant is not None:
+                await send_dm_safely(applicant, embed=dm_embed)
+            progress["dm_attempted"] = True
+            db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
+
+        disable_stage = str(payload.get("disable_stage") or "")
+        if disable_stage == "review" and not progress["review_message_disabled"]:
+            await refresh_review_message(guild, application, disabled=True)
+            progress["review_message_disabled"] = True
+            db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
+        elif disable_stage == "interview" and not progress["interview_message_disabled"]:
+            await refresh_interview_message(guild, application, disabled=True)
+            progress["interview_message_disabled"] = True
+            db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
+
+        if not progress["archived"]:
+            channel = guild.get_channel(int(application["channel_id"]))
+            if not isinstance(channel, discord.TextChannel):
+                raise RuntimeError("Канал заявки не найден на сервере.")
+
+            reviewer = None
+            reviewer_id = int(job["reviewer_id"] or application["reviewer_id"] or 0)
+            if reviewer_id:
+                reviewer = guild.get_member(reviewer_id)
+                if reviewer is None:
+                    reviewer = await fetch_application_user(guild, reviewer_id)
+
+            archive_seq = await archive_application_channel(
+                channel,
+                config,
+                application,
+                reviewer,
+                str(payload.get("archive_final_text") or "Заявка завершена."),
+            )
+            progress["archived"] = True
+            db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
+
+        db.update_recovery_job(
+            application_id,
+            job_status=RECOVERY_JOB_DONE,
+            last_error=None,
+            progress_json=json.dumps(progress, ensure_ascii=False),
+        )
+        return True, int(archive_seq or application["archive_seq"] or 0), ""
+    except Exception as exc:
+        logger.exception("Не удалось завершить recovery-задачу для заявки %s", application_id)
+        db.update_recovery_job(
+            application_id,
+            job_status=RECOVERY_JOB_FAILED,
+            last_error=str(exc),
+            progress_json=json.dumps(progress, ensure_ascii=False),
+        )
+        return False, int(archive_seq or application["archive_seq"] or 0), str(exc)
+
+
+async def application_needs_archive_recovery(guild: discord.Guild, config: GuildConfig, application: sqlite3.Row) -> bool:
+    if application["status"] not in FINAL_STATUSES:
+        return False
+
+    channel = guild.get_channel(int(application["channel_id"]))
+    if not isinstance(channel, discord.TextChannel):
+        return int(application["archive_seq"] or 0) == 0 or not application["archived_at"]
+
+    archive_seq = int(application["archive_seq"] or 0)
+    if archive_seq == 0 or not application["archived_at"]:
+        return True
+    if config.archive_category_id and channel.category_id != config.archive_category_id:
+        return True
+
+    expected_name = build_archive_channel_name(int(application["user_id"]), archive_seq)
+    return channel.name != expected_name
+
+
+async def discover_archive_recovery_jobs(guild: discord.Guild, *, application_id: Optional[int] = None) -> int:
+    config = db.get_config(guild.id)
+    applications = db.list_final_applications(guild.id, application_id=application_id)
+    discovered = 0
+
+    for application in applications:
+        if not await application_needs_archive_recovery(guild, config, application):
+            continue
+        existing = db.get_recovery_job(int(application["id"]))
+        db.upsert_recovery_job(
+            int(application["id"]),
+            guild_id=int(application["guild_id"]),
+            channel_id=int(application["channel_id"]),
+            reviewer_id=int(application["reviewer_id"] or 0),
+            final_status=str(application["status"]),
+            payload=build_legacy_archive_recovery_payload(application),
+            reset_status=True,
+        )
+        if existing is None or str(existing["job_status"]) == RECOVERY_JOB_DONE:
+            discovered += 1
+
+    return discovered
+
+
+async def open_application_chat(interaction: discord.Interaction) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member) or not isinstance(interaction.channel, discord.TextChannel):
+        await interaction.response.send_message("Эта кнопка работает только на сервере.", ephemeral=True)
+        return
+
+    application = db.get_application_by_channel(interaction.channel.id)
+    if not application:
+        await interaction.response.send_message("Не удалось найти заявку в базе.", ephemeral=True)
+        return
+
+    reviewer_id = claimed_reviewer_id(application)
+    if not reviewer_id:
+        await interaction.response.send_message("Сначала нажми «Взять на рассмотрение».", ephemeral=True)
+        return
+    if reviewer_id != interaction.user.id:
+        await interaction.response.send_message(
+            f"Эту заявку рассматривает <@{reviewer_id}>.",
+            ephemeral=True,
+        )
+        return
+
+    if application["status"] not in (STATUS_SUBMITTED, STATUS_APPROVED_PENDING, STATUS_RESERVE_PENDING):
+        await interaction.response.send_message("Открыть чат можно только по активной заявке.", ephemeral=True)
+        return
+
+    if application_chat_opened(application):
+        await interaction.response.send_message("Чат уже открыт для кандидата и рекрута.", ephemeral=True)
+        return
+
+    applicant_id = int(application["user_id"])
+    await interaction.channel.set_permissions(
+        discord.Object(id=applicant_id),
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        attach_files=True,
+        embed_links=True,
+        reason="Открыт чат кандидата с рекрутом по заявке",
+    )
+    await interaction.channel.set_permissions(
+        discord.Object(id=reviewer_id),
+        view_channel=True,
+        send_messages=True,
+        read_message_history=True,
+        attach_files=True,
+        embed_links=True,
+        reason="Открыт чат кандидата с рекрутом по заявке",
+    )
+
+    db.update_application(int(application["id"]), chat_opened=1)
+    application = db.get_application_by_channel(interaction.channel.id)
+    if application and application["status"] == STATUS_SUBMITTED:
+        await refresh_review_message(interaction.guild, application)
+    elif application and application["status"] in (STATUS_APPROVED_PENDING, STATUS_RESERVE_PENDING):
+        await refresh_interview_message(interaction.guild, application)
+
+    await interaction.channel.send(
+        f"🗨️ Чат открыт для <@{applicant_id}> и <@{reviewer_id}>. Здесь можно договориться об обзвоне и задать вопросы."
+    )
+    await interaction.response.send_message("Чат открыт.", ephemeral=True)
 
 
 class RejectReasonModal(discord.ui.Modal):
@@ -875,20 +1356,32 @@ class RejectReasonModal(discord.ui.Modal):
             f"**Причина:** {reason}\n"
             f"**Рассматривал заявку:** {reviewer.mention}"
         )
-        embed = build_results_embed("Заявка отклонена", description, COLOR_DANGER)
-        await send_results_message(interaction.guild, config, embed)
-        if applicant:
-            await send_dm_safely(applicant, embed=build_results_embed("Заявка отклонена", description, COLOR_DANGER))
+        result_embed = build_results_embed("Заявка отклонена", description, COLOR_DANGER)
+        payload = build_recovery_payload(
+            results_embed=result_embed,
+            dm_embed=result_embed,
+            disable_stage="interview" if self.interview_stage else "review",
+            archive_final_text=f'Заявка была отклонена по причине: "{reason}".',
+        )
+        db.upsert_recovery_job(
+            application["id"],
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel.id,
+            reviewer_id=reviewer.id,
+            final_status=rejected_status,
+            payload=payload,
+        )
+        success, archive_seq, error_text = await run_application_recovery_job(interaction.guild, application["id"])
+        if success:
+            await interaction.followup.send(
+                f"Причина сохранена. Заявка архивирована как `{build_archive_channel_name(application['user_id'], archive_seq)}`.",
+                ephemeral=True,
+            )
+            return
 
-        if self.interview_stage:
-            await refresh_interview_message(interaction.guild, application, disabled=True)
-        else:
-            await refresh_review_message(interaction.guild, application, disabled=True)
-
-        final_text = f'Заявка была отклонена по причине: "{reason}".'
-        archive_seq = await archive_application_channel(interaction.channel, config, application, reviewer, final_text)
         await interaction.followup.send(
-            f"Причина сохранена. Заявка архивирована как `{build_archive_channel_name(application['user_id'], archive_seq)}`.",
+            "Причина сохранена, но не все действия удалось завершить сразу. "
+            f"Запусти `/family_retry application_id:{application['id']}`. Ошибка: {error_text}",
             ephemeral=True,
         )
 
@@ -1106,6 +1599,7 @@ async def fetch_application_user(guild: discord.Guild, user_id: int) -> Optional
         return None
 
 
+
 async def refresh_review_message(guild: discord.Guild, application: sqlite3.Row, *, disabled: bool = False) -> None:
     if not application["review_message_id"]:
         return
@@ -1122,19 +1616,36 @@ async def refresh_review_message(guild: discord.Guild, application: sqlite3.Row,
         return
 
     reviewer_mention = f"<@{claimed_reviewer_id(application)}>" if claimed_reviewer_id(application) else None
-    embed = build_application_embed(applicant, json.loads(application["answers_json"]), int(application["id"]), reviewer_mention)
+    embed = build_application_embed(
+        applicant,
+        json.loads(application["answers_json"]),
+        int(application["id"]),
+        reviewer_mention,
+        chat_opened=application_chat_opened(application),
+    )
     try:
-        await message.edit(embed=embed, view=ReviewView(claimed=bool(claimed_reviewer_id(application)), disabled=disabled))
+        await message.edit(
+            embed=embed,
+            view=ReviewView(
+                claimed=bool(claimed_reviewer_id(application)),
+                disabled=disabled,
+                chat_opened=application_chat_opened(application),
+            ),
+        )
     except Exception:
         logger.exception("Не удалось обновить сообщение заявки %s", application["id"])
 
 
-def build_interview_stage_embed(reviewer_mention: str) -> discord.Embed:
+
+
+def build_interview_stage_embed(reviewer_mention: str, *, chat_opened: bool = False) -> discord.Embed:
+    extra_note = "\n\n🗨️ Чат с кандидатом открыт в этом канале." if chat_opened else ""
     return discord.Embed(
         title="🎙️ Как прошёл обзвон?",
         description=(
             f"**Заявку продолжает вести:** {reviewer_mention}\n\n"
             "После завершения обзвона выбери итог ниже."
+            f"{extra_note}"
         ),
         color=COLOR_INFO,
         timestamp=datetime.now(timezone.utc),
@@ -1155,18 +1666,24 @@ async def refresh_interview_message(guild: discord.Guild, application: sqlite3.R
     reviewer_mention = f"<@{claimed_reviewer_id(application)}>" if claimed_reviewer_id(application) else "не назначен"
     try:
         await message.edit(
-            embed=build_interview_stage_embed(reviewer_mention),
-            view=InterviewView(claimed=bool(claimed_reviewer_id(application)), disabled=disabled),
+            embed=build_interview_stage_embed(reviewer_mention, chat_opened=application_chat_opened(application)),
+            view=InterviewView(
+                claimed=bool(claimed_reviewer_id(application)),
+                disabled=disabled,
+                chat_opened=application_chat_opened(application),
+            ),
         )
     except Exception:
         logger.exception("Не удалось обновить сообщение этапа обзвона %s", application["id"])
 
 
+
 class ReviewView(discord.ui.View):
-    def __init__(self, *, claimed: bool = False, disabled: bool = False):
+    def __init__(self, *, claimed: bool = False, disabled: bool = False, chat_opened: bool = False):
         super().__init__(timeout=None)
         decisions_enabled = claimed and not disabled
         self.take.disabled = disabled or claimed
+        self.open_chat.disabled = disabled or not claimed or chat_opened
         self.approve.disabled = not decisions_enabled
         self.reserve.disabled = not decisions_enabled
         self.reject.disabled = not decisions_enabled
@@ -1244,6 +1761,10 @@ class ReviewView(discord.ui.View):
             await refresh_review_message(interaction.guild, application)
         await interaction.response.send_message("Заявка закреплена за тобой.", ephemeral=True)
 
+    @discord.ui.button(label="Открыть чат", style=discord.ButtonStyle.primary, custom_id="family_review_open_chat", emoji="💬")
+    async def open_chat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await open_application_chat(interaction)
+
     @discord.ui.button(label="Одобрить", style=discord.ButtonStyle.success, custom_id="family_review_approve")
     async def approve(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
         await process_review_decision(interaction, reserve=False)
@@ -1257,9 +1778,11 @@ class ReviewView(discord.ui.View):
         await interaction.response.send_modal(RejectReasonModal(interview_stage=False))
 
 
+
 class InterviewView(discord.ui.View):
-    def __init__(self, *, claimed: bool = True, disabled: bool = False):
+    def __init__(self, *, claimed: bool = True, disabled: bool = False, chat_opened: bool = False):
         super().__init__(timeout=None)
+        self.open_chat.disabled = disabled or not claimed or chat_opened
         self.accept.disabled = disabled or not claimed
         self.reject.disabled = disabled or not claimed
 
@@ -1290,6 +1813,10 @@ class InterviewView(discord.ui.View):
             )
             return False
         return True
+
+    @discord.ui.button(label="Открыть чат", style=discord.ButtonStyle.primary, custom_id="family_interview_open_chat", emoji="💬")
+    async def open_chat(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await open_application_chat(interaction)
 
     @discord.ui.button(label="Отлично! Принят!", style=discord.ButtonStyle.success, custom_id="family_interview_accept")
     async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
@@ -1326,18 +1853,31 @@ class InterviewView(discord.ui.View):
             f"Пользователь {applicant_label} успешно прошёл обзвон.\n"
             f"**Рассматривал заявку:** {interaction.user.mention}"
         )
-        await send_results_message(interaction.guild, config, build_results_embed("Обзвон успешно пройден", result_text, COLOR_SUCCESS))
-        await refresh_interview_message(interaction.guild, application, disabled=True)
-
-        archive_seq = await archive_application_channel(
-            interaction.channel,
-            config,
-            application,
-            interaction.user,
-            "Заявка была принята.",
+        payload = build_recovery_payload(
+            results_embed=build_results_embed("Обзвон успешно пройден", result_text, COLOR_SUCCESS),
+            dm_embed=None,
+            disable_stage="interview",
+            archive_final_text="Заявка была принята.",
         )
+        db.upsert_recovery_job(
+            application["id"],
+            guild_id=interaction.guild.id,
+            channel_id=interaction.channel.id,
+            reviewer_id=interaction.user.id,
+            final_status=STATUS_ACCEPTED,
+            payload=payload,
+        )
+        success, archive_seq, error_text = await run_application_recovery_job(interaction.guild, application["id"])
+        if success:
+            await interaction.followup.send(
+                f"Обзвон отмечен как успешный. Канал архивирован как `{build_archive_channel_name(application['user_id'], archive_seq)}`.",
+                ephemeral=True,
+            )
+            return
+
         await interaction.followup.send(
-            f"Обзвон отмечен как успешный. Канал архивирован как `{build_archive_channel_name(application['user_id'], archive_seq)}`.",
+            "Обзвон сохранён, но не все действия удалось завершить сразу. "
+            f"Запусти `/family_retry application_id:{application['id']}`. Ошибка: {error_text}",
             ephemeral=True,
         )
 
@@ -1431,8 +1971,8 @@ async def process_review_decision(interaction: discord.Interaction, reserve: boo
 
     reviewer_mention = reviewer.mention
     interview_message = await interaction.channel.send(
-        embed=build_interview_stage_embed(reviewer_mention),
-        view=InterviewView(claimed=True),
+        embed=build_interview_stage_embed(reviewer_mention, chat_opened=application_chat_opened(application)),
+        view=InterviewView(claimed=True, chat_opened=application_chat_opened(application)),
     )
     db.update_application(application["id"], interview_message_id=interview_message.id)
 
@@ -1702,6 +2242,62 @@ async def family_sync(interaction: discord.Interaction) -> None:
     await interaction.response.send_message(f"Команды синхронизированы: {synced}", ephemeral=True)
 
 
+
+@app_commands.command(name="family_retry", description="Повторить зависшие действия по заявкам")
+@app_commands.describe(
+    application_id="ID заявки, если нужно повторить только одну",
+)
+async def family_retry(
+    interaction: discord.Interaction,
+    application_id: Optional[int] = None,
+) -> None:
+    if not interaction.guild or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("Команда работает только на сервере.", ephemeral=True)
+        return
+
+    config = db.get_config(interaction.guild.id)
+    if not has_reviewer_access(interaction.user, config):
+        await interaction.response.send_message("У тебя нет доступа к этой команде.", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+
+    discovered = await discover_archive_recovery_jobs(interaction.guild, application_id=application_id)
+    jobs = db.list_recovery_jobs(
+        interaction.guild.id,
+        states=(RECOVERY_JOB_PENDING, RECOVERY_JOB_FAILED, RECOVERY_JOB_RUNNING),
+        application_id=application_id,
+    )
+
+    if not jobs:
+        suffix = f" по заявке `{application_id}`" if application_id is not None else ""
+        await interaction.followup.send(f"Зависших действий{suffix} не найдено.", ephemeral=True)
+        return
+
+    success_count = 0
+    failed_count = 0
+    failed_items: list[str] = []
+
+    for job in jobs:
+        ok, _, error_text = await run_application_recovery_job(interaction.guild, int(job["application_id"]))
+        if ok:
+            success_count += 1
+        else:
+            failed_count += 1
+            failed_items.append(f"`{job['application_id']}` — {error_text}")
+
+    summary = (
+        f"Готово. Найдено задач: **{len(jobs)}**\n"
+        f"Новых/переоткрытых задач: **{discovered}**\n"
+        f"Успешно завершено: **{success_count}**\n"
+        f"С ошибками осталось: **{failed_count}**"
+    )
+    if failed_items:
+        summary += "\n\nОшибки:\n" + "\n".join(failed_items[:10])
+
+    await interaction.followup.send(summary, ephemeral=True)
+
+
 @app_commands.command(name="family_archive_find", description="Найти архивные заявки пользователя")
 @app_commands.describe(
     user="Пользователь сервера",
@@ -1800,6 +2396,7 @@ bot.tree.add_command(family_recruitment)
 bot.tree.add_command(family_cooldown)
 bot.tree.add_command(family_config)
 bot.tree.add_command(family_sync)
+bot.tree.add_command(family_retry)
 bot.tree.add_command(family_archive_find)
 
 
