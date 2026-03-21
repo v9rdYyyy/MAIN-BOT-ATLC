@@ -161,6 +161,8 @@ class Database:
                     reason TEXT,
                     archive_seq INTEGER DEFAULT 0,
                     archived_at TEXT,
+                    archive_message_channel_id INTEGER DEFAULT 0,
+                    archive_message_id INTEGER DEFAULT 0,
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 )
@@ -176,6 +178,8 @@ class Database:
             self._ensure_column(conn, "applications", "interview_message_id", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "applications", "archive_seq", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "applications", "archived_at", "TEXT")
+            self._ensure_column(conn, "applications", "archive_message_channel_id", "INTEGER DEFAULT 0")
+            self._ensure_column(conn, "applications", "archive_message_id", "INTEGER DEFAULT 0")
             self._ensure_column(conn, "applications", "chat_opened", "INTEGER DEFAULT 0")
             conn.execute(
                 """
@@ -857,6 +861,9 @@ def build_results_embed(title: str, description: str, color: discord.Color) -> d
     return discord.Embed(title=title, description=description, color=color, timestamp=datetime.now(timezone.utc))
 
 
+def build_message_jump_url(guild_id: int, channel_id: int, message_id: int) -> str:
+    return f"https://discord.com/channels/{guild_id}/{channel_id}/{message_id}"
+
 
 def application_chat_opened(application: sqlite3.Row | None) -> bool:
     return bool(int(application["chat_opened"] or 0)) if application else False
@@ -869,6 +876,7 @@ def default_recovery_progress() -> dict[str, bool]:
         "review_message_disabled": False,
         "interview_message_disabled": False,
         "archived": False,
+        "source_channel_deleted": False,
     }
 
 
@@ -1028,63 +1036,90 @@ async def refresh_panel_message(guild: discord.Guild) -> None:
 
 
 
-async def archive_application_channel(
-    channel: discord.TextChannel,
+def application_has_archive_message(application: sqlite3.Row | None) -> bool:
+    if not application:
+        return False
+    return bool(int(application["archive_message_channel_id"] or 0) and int(application["archive_message_id"] or 0))
+
+
+def archive_result_summary(application: sqlite3.Row) -> tuple[str, str]:
+    reason = str(application["reason"] or "").strip()
+    if application["status"] == STATUS_ACCEPTED:
+        return "Принятие", "Заявка была принята."
+    if application["status"] in {STATUS_REJECTED, STATUS_INTERVIEW_FAILED}:
+        if reason:
+            return "Отказ", f"Заявка была отклонена. Причина: {reason}"
+        return "Отказ", "Заявка была отклонена. Причина не указана."
+    return "Завершение", "Заявка была завершена."
+
+
+def should_delete_source_application_channel(
+    channel: discord.TextChannel | None,
+    config: GuildConfig,
+    application: sqlite3.Row,
+) -> bool:
+    if not isinstance(channel, discord.TextChannel):
+        return False
+
+    archive_seq = int(application["archive_seq"] or 0)
+    expected_legacy_name = build_archive_channel_name(int(application["user_id"]), archive_seq) if archive_seq else ""
+    if application["archived_at"] and (
+        (config.archive_category_id and channel.category_id == config.archive_category_id)
+        or (expected_legacy_name and channel.name == expected_legacy_name)
+    ):
+        return False
+    return True
+
+
+async def get_archive_log_channel(guild: discord.Guild, config: GuildConfig) -> discord.TextChannel:
+    channel = guild.get_channel(config.result_channel_id)
+    if not isinstance(channel, discord.TextChannel):
+        raise RuntimeError("Канал итогов/архива не найден. Проверь настройку /family_setup.")
+    return channel
+
+
+async def archive_application_to_message(
+    guild: discord.Guild,
     config: GuildConfig,
     application: sqlite3.Row,
     reviewer: discord.abc.User | discord.Member | None,
-    final_text: str,
-) -> int:
+) -> tuple[int, int, int]:
     archive_seq = int(application["archive_seq"] or 0) or db.next_archive_seq(application["guild_id"], application["user_id"])
-    archive_category = await get_or_create_category(channel.guild, config.archive_category_id, ARCHIVE_CATEGORY_NAME)
-    archive_name = build_archive_channel_name(application["user_id"], archive_seq)
+    log_channel = await get_archive_log_channel(guild, config)
 
     reviewer_id = int(reviewer.id) if reviewer else int(application["reviewer_id"] or 0)
     reviewer_text = reviewer.mention if reviewer else (f"<@{reviewer_id}>" if reviewer_id else "не указан")
+    applicant_text = f"<@{int(application['user_id'])}>"
+    decision_title, decision_text = archive_result_summary(application)
+
+    embed = discord.Embed(
+        title=f"Архив заявки #{archive_seq:03d}",
+        description=(
+            f"**Кого рассматривали:** {applicant_text}\n"
+            f"**Рассматривал:** {reviewer_text}\n"
+            f"**Решение:** {decision_title}\n"
+            f"**ID заявки:** `{application['id']}`\n"
+            f"**Итог:** {decision_text}"
+        ),
+        color=COLOR_SUCCESS if application["status"] == STATUS_ACCEPTED else COLOR_DANGER,
+        timestamp=datetime.now(timezone.utc),
+    )
+
+    archive_message = await log_channel.send(
+        content=f"Архив заявки #{archive_seq:03d} • {applicant_text} • Рассматривал {reviewer_text}",
+        embed=embed,
+    )
 
     db.update_application(
         application["id"],
         reviewer_id=reviewer_id,
         archive_seq=archive_seq,
-        archived_at=utcnow(),
+        archived_at=str(application["archived_at"] or utcnow()),
+        archive_message_channel_id=log_channel.id,
+        archive_message_id=archive_message.id,
         chat_opened=0,
     )
-
-    try:
-        await channel.set_permissions(
-            discord.Object(id=int(application["user_id"])),
-            overwrite=None,
-            reason="Заявка завершена и отправлена в архив",
-        )
-    except Exception:
-        logger.exception("Не удалось очистить доступ кандидата к каналу %s", channel.id)
-
-    if reviewer_id:
-        try:
-            await channel.set_permissions(
-                discord.Object(id=reviewer_id),
-                overwrite=None,
-                reason="Заявка завершена и отправлена в архив",
-            )
-        except Exception:
-            logger.exception("Не удалось очистить персональный доступ рекрута к каналу %s", channel.id)
-
-    await channel.edit(
-        category=archive_category,
-        name=archive_name,
-        topic=(
-            f"Архив заявки пользователя {application['user_id']} | №{archive_seq:03d} | Рассматривал {reviewer_id or 'не указан'}"
-        )[:1024],
-        reason="Заявка рассмотрена и отправлена в архив",
-    )
-
-    await clear_channel_history(channel)
-    await channel.send(
-        f"Канал архивирован.\n"
-        f"Заявка завершена. Рассматривал: {reviewer_text}\n"
-        f"{final_text}"
-    )
-    return archive_seq
+    return archive_seq, log_channel.id, archive_message.id
 
 
 
@@ -1113,6 +1148,13 @@ async def run_application_recovery_job(guild: discord.Guild, application_id: int
     try:
         applicant = await fetch_application_user(guild, int(application["user_id"]))
 
+        if application_has_archive_message(application):
+            progress["archived"] = True
+
+        channel = guild.get_channel(int(application["channel_id"]))
+        if not isinstance(channel, discord.TextChannel) or not should_delete_source_application_channel(channel, config, application):
+            progress["source_channel_deleted"] = True
+
         results_embed = payload_to_embed(payload.get("results_embed"))
         if results_embed is not None and not progress["results_sent"]:
             await send_results_message(guild, config, results_embed)
@@ -1136,26 +1178,29 @@ async def run_application_recovery_job(guild: discord.Guild, application_id: int
             progress["interview_message_disabled"] = True
             db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
 
+        reviewer = None
+        reviewer_id = int(job["reviewer_id"] or application["reviewer_id"] or 0)
+        if reviewer_id:
+            reviewer = guild.get_member(reviewer_id)
+            if reviewer is None:
+                reviewer = await fetch_application_user(guild, reviewer_id)
+
         if not progress["archived"]:
-            channel = guild.get_channel(int(application["channel_id"]))
-            if not isinstance(channel, discord.TextChannel):
-                raise RuntimeError("Канал заявки не найден на сервере.")
-
-            reviewer = None
-            reviewer_id = int(job["reviewer_id"] or application["reviewer_id"] or 0)
-            if reviewer_id:
-                reviewer = guild.get_member(reviewer_id)
-                if reviewer is None:
-                    reviewer = await fetch_application_user(guild, reviewer_id)
-
-            archive_seq = await archive_application_channel(
-                channel,
+            archive_seq, _, _ = await archive_application_to_message(
+                guild,
                 config,
                 application,
                 reviewer,
-                str(payload.get("archive_final_text") or "Заявка завершена."),
             )
             progress["archived"] = True
+            db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
+            application = db.get_application_by_id(application_id) or application
+
+        if not progress["source_channel_deleted"]:
+            channel = guild.get_channel(int(application["channel_id"]))
+            if isinstance(channel, discord.TextChannel) and should_delete_source_application_channel(channel, config, application):
+                await channel.delete(reason="Заявка завершена, архив сохранён сообщением")
+            progress["source_channel_deleted"] = True
             db.update_recovery_job(application_id, progress_json=json.dumps(progress, ensure_ascii=False))
 
         db.update_recovery_job(
@@ -1164,6 +1209,7 @@ async def run_application_recovery_job(guild: discord.Guild, application_id: int
             last_error=None,
             progress_json=json.dumps(progress, ensure_ascii=False),
         )
+        application = db.get_application_by_id(application_id) or application
         return True, int(archive_seq or application["archive_seq"] or 0), ""
     except Exception as exc:
         logger.exception("Не удалось завершить recovery-задачу для заявки %s", application_id)
@@ -1180,18 +1226,16 @@ async def application_needs_archive_recovery(guild: discord.Guild, config: Guild
     if application["status"] not in FINAL_STATUSES:
         return False
 
+    if int(application["archive_seq"] or 0) == 0 or not application["archived_at"]:
+        return True
+    if not application_has_archive_message(application):
+        return True
+
     channel = guild.get_channel(int(application["channel_id"]))
     if not isinstance(channel, discord.TextChannel):
-        return int(application["archive_seq"] or 0) == 0 or not application["archived_at"]
+        return False
 
-    archive_seq = int(application["archive_seq"] or 0)
-    if archive_seq == 0 or not application["archived_at"]:
-        return True
-    if config.archive_category_id and channel.category_id != config.archive_category_id:
-        return True
-
-    expected_name = build_archive_channel_name(int(application["user_id"]), archive_seq)
-    return channel.name != expected_name
+    return should_delete_source_application_channel(channel, config, application)
 
 
 async def discover_archive_recovery_jobs(guild: discord.Guild, *, application_id: Optional[int] = None) -> int:
@@ -1374,7 +1418,7 @@ class RejectReasonModal(discord.ui.Modal):
         success, archive_seq, error_text = await run_application_recovery_job(interaction.guild, application["id"])
         if success:
             await interaction.followup.send(
-                f"Причина сохранена. Заявка архивирована как `{build_archive_channel_name(application['user_id'], archive_seq)}`.",
+                f"Причина сохранена. Архивная запись `#{archive_seq:03d}` создана в канале итогов.",
                 ephemeral=True,
             )
             return
@@ -1870,7 +1914,7 @@ class InterviewView(discord.ui.View):
         success, archive_seq, error_text = await run_application_recovery_job(interaction.guild, application["id"])
         if success:
             await interaction.followup.send(
-                f"Обзвон отмечен как успешный. Канал архивирован как `{build_archive_channel_name(application['user_id'], archive_seq)}`.",
+                f"Обзвон отмечен как успешный. Архивная запись `#{archive_seq:03d}` создана в канале итогов.",
                 ephemeral=True,
             )
             return
@@ -1985,11 +2029,11 @@ async def process_review_decision(interaction: discord.Interaction, reserve: boo
 # ============================================================
 @app_commands.command(name="family_setup", description="Настроить каналы, роль рекрутов и внешний вид панели")
 @app_commands.describe(
-    result_channel="Канал итогов заявок",
+    result_channel="Канал итогов и архива заявок",
     voice_channel="Голосовой канал для обзвона",
     review_role="Роль рекрутов",
     applications_category="Категория активных заявок",
-    archive_category="Категория архива",
+    archive_category="Legacy-поле, можно не указывать",
     server_name="Название сервера в сообщениях бота",
     panel_image_url="Ссылка на картинку для главной панели (необязательно)",
 )
@@ -2029,12 +2073,12 @@ async def family_setup(
     await refresh_panel_message(interaction.guild)
 
     embed = discord.Embed(title="Настройка сохранена", color=COLOR_SUCCESS)
-    embed.add_field(name="Канал итогов", value=f"{result_channel.mention}\n`{config.result_channel_id}`", inline=False)
+    embed.add_field(name="Канал итогов и архива", value=f"{result_channel.mention}\n`{config.result_channel_id}`", inline=False)
     embed.add_field(name="Голосовой канал", value=f"{voice_channel.mention}\n`{config.voice_channel_id}`", inline=False)
     embed.add_field(name="Роль рекрутов", value=f"{review_role.mention}\n`{config.review_role_id}`", inline=False)
     embed.add_field(name="Пинг роли при новой заявке", value=recruiter_ping_summary(interaction.guild, config), inline=False)
     embed.add_field(name="Категория заявок", value=applications_category.mention if applications_category else "Автосоздание", inline=False)
-    embed.add_field(name="Категория архива", value=archive_category.mention if archive_category else "Автосоздание", inline=False)
+    embed.add_field(name="Категория архива (legacy)", value=archive_category.mention if archive_category else "Не используется", inline=False)
     embed.add_field(name="Название сервера", value=config.server_name, inline=False)
     embed.add_field(name="Медиа панели", value=panel_media_summary(config), inline=False)
     await interaction.response.send_message(embed=embed, ephemeral=True)
@@ -2211,12 +2255,12 @@ async def family_config(interaction: discord.Interaction) -> None:
 
     config = db.get_config(interaction.guild.id)
     embed = discord.Embed(title="Текущая настройка", color=COLOR_INFO)
-    embed.add_field(name="Канал итогов", value=f"`{config.result_channel_id or 0}`", inline=False)
+    embed.add_field(name="Канал итогов и архива", value=f"`{config.result_channel_id or 0}`", inline=False)
     embed.add_field(name="Голосовой канал проверки", value=f"`{config.voice_channel_id or 0}`", inline=False)
     embed.add_field(name="Роль рекрутов", value=f"`{config.review_role_id or 0}`", inline=False)
     embed.add_field(name="Пинг роли при новой заявке", value=recruiter_ping_summary(interaction.guild, config), inline=False)
     embed.add_field(name="Категория заявок", value=f"`{config.applications_category_id or 0}`", inline=False)
-    embed.add_field(name="Категория архива", value=f"`{config.archive_category_id or 0}`", inline=False)
+    embed.add_field(name="Категория архива (legacy)", value=f"`{config.archive_category_id or 0}`", inline=False)
     embed.add_field(name="Статус набора", value="Открыт" if config.recruitment_open else "Закрыт", inline=False)
     embed.add_field(
         name="Кулдаун заявок",
@@ -2356,9 +2400,11 @@ async def family_archive_find(
 
     lines: list[str] = []
     for row in archived_rows[:20]:
-        archived_channel_name = build_archive_channel_name(row["user_id"], row["archive_seq"] or 0)
-        channel_obj = interaction.guild.get_channel(row["channel_id"])
-        channel_text = channel_obj.mention if isinstance(channel_obj, discord.TextChannel) else f"`{archived_channel_name}`"
+        archive_channel_id = int(row["archive_message_channel_id"] or config.result_channel_id or 0)
+        archive_message_id = int(row["archive_message_id"] or 0)
+        archive_channel_obj = interaction.guild.get_channel(archive_channel_id)
+        archive_channel_text = archive_channel_obj.mention if isinstance(archive_channel_obj, discord.TextChannel) else f"`{archive_channel_id or 0}`"
+        archive_link = build_message_jump_url(interaction.guild.id, archive_channel_id, archive_message_id) if archive_channel_id and archive_message_id else "не найдено"
 
         reviewer_text = f"<@{row['reviewer_id']}>" if row["reviewer_id"] else "не указан"
         status_map = {
@@ -2374,10 +2420,12 @@ async def family_archive_find(
         when_text = archived_at[:19].replace("T", " ") if archived_at else "неизвестно"
 
         lines.append(
-            f"**#{row['archive_seq']:03d}** • {channel_text}\n"
+            f"**#{row['archive_seq']:03d}** • {archive_channel_text}\n"
             f"Статус: **{status_text}**\n"
             f"Причина: {reason_text}\n"
+            f"Кого рассматривали: <@{row['user_id']}>\n"
             f"Рассматривал: {reviewer_text}\n"
+            f"Сообщение: {archive_link}\n"
             f"Архивировано: `{when_text} UTC`"
         )
 
