@@ -191,6 +191,7 @@ class UnifiedBot(commands.Bot):
             module.family_cooldown,
             module.family_config,
             module.family_sync,
+            module.family_retry,
             module.family_archive_find,
         ):
             try:
